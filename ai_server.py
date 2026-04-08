@@ -3,6 +3,8 @@ from pydantic import BaseModel
 from transformers import AutoModelForCausalLM, AutoTokenizer
 from peft import PeftModel
 import torch
+import re
+from typing import List
 
 app = FastAPI()
 
@@ -10,28 +12,43 @@ print("Loading Base Model... (This might take a minute)")
 model_id = "Qwen/Qwen2.5-Coder-1.5B"
 tokenizer = AutoTokenizer.from_pretrained(model_id)
 
-# Load the base model (we load it in 8-bit or standard depending on your PC's RAM)
+# Load the base model
 base_model = AutoModelForCausalLM.from_pretrained(
     model_id, 
     torch_dtype=torch.float16, 
-    device_map="auto" # Automatically uses GPU if you have one, else CPU
+    device_map="auto"
 )
 
 print("Attaching your custom trained LoRA weights...")
-# This points to the folder you downloaded from Google Drive!
 model = PeftModel.from_pretrained(base_model, "./production-coder-lora")
+
+# --- NEW: Define the Memory Structure ---
+class MessageItem(BaseModel):
+    role: str
+    content: str
 
 class PromptRequest(BaseModel):
     prompt: str
+    history: List[MessageItem] = [] # Defaults to empty if it's a new chat
 
 @app.post("/generate")
 def generate_code(request: PromptRequest):
     
+    # --- NEW: Reconstruct the Memory Block ---
+    memory_block = ""
+    # We only inject the last 4 messages so we don't overload the AI's RAM
+    for msg in request.history[-4:]: 
+        if msg.role == 'user':
+            memory_block += f"User: {msg.content}\n"
+        elif msg.role == 'ai':
+            # We wrap the AI's past memory in backticks so it remembers it wrote code
+            memory_block += f"Assistant:\n\x60\x60\x60python\n{msg.content}\n\x60\x60\x60\n"
+
     # Secretly force the AI to only write code
     strict_instruction = f"{request.prompt}\n\nIMPORTANT: Write ONLY valid, raw Python code. Do not write any English explanations. Do not use markdown blocks. your code is being reviewed by codex , opus 4.6 and gemini so make sure to follow best practices and write clean code."
     
-    # Format exactly how we trained it in Colab
-    formatted_prompt = f"User: {strict_instruction}\nAssistant:\n"
+    # Inject the memory right before the new prompt
+    formatted_prompt = f"{memory_block}User: {strict_instruction}\nAssistant:\n"
     
     inputs = tokenizer(formatted_prompt, return_tensors="pt").to(model.device)
     
@@ -48,17 +65,12 @@ def generate_code(request: PromptRequest):
     raw_output = response_text.split("Assistant:\n")[-1].strip()
     
     # --- THE BULLETPROOF SANITIZER ---
-    
-    # 1. Stop the AI from hallucinating a fake user conversation
     raw_output = raw_output.split("User:")[0].strip()
     
-    # 2. Extract code block using standard Python splitting (no regex bugs!)
-    if "```" in raw_output:
-        parts = raw_output.split("```")
-        # The code is usually in the second block between the backticks
+    if "\x60\x60\x60" in raw_output:
+        parts = raw_output.split("\x60\x60\x60")
         if len(parts) >= 3:
             extracted_code = parts[1]
-            # Strip the word "python" if it added it to the top of the block
             if extracted_code.lower().startswith("python"):
                 extracted_code = extracted_code[6:]
             final_code = extracted_code.strip()
